@@ -135,8 +135,10 @@ class ESA(nn.Module):
         return x * m
 
 
+
 class RFDB(nn.Module):
-    def __init__(self, in_channels, distillation_rate=0.25, act_type='lrelu', use_cbam=False):
+    def __init__(self, in_channels, distillation_rate=0.25, act_type='lrelu', use_cbam=False, use_a2n=False, spa_prune=False,
+                gct=False, simAM=False):
         super(RFDB, self).__init__()
         self.dc = self.distilled_channels = in_channels//2
         self.rc = self.remaining_channels = in_channels
@@ -150,29 +152,89 @@ class RFDB(nn.Module):
         self.act = activation(act_type, neg_slope=0.05)
         self.c5 = conv_layer(self.dc*4, in_channels, 1)
         self.esa = ESA(in_channels, nn.Conv2d, act_type)
-        # if use_cbam:
-        #     self.esa = CBAM(in_channels)
+
+        self.gct = gct
+        if gct:
+            self.gct = GCT(num_channels=self.dc*4)
+        if use_cbam:
+            self.esa = CBAM(in_channels)
+        if simAM:
+            self.esa = SimAM()
+        self.use_a2n = use_a2n
+        if self.use_a2n:
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+            self.ADM = nn.Sequential(
+                nn.Linear(in_channels, in_channels // 10, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_channels // 10, 4, bias=False),
+            )
+        self.spa_prune = spa_prune
+        if spa_prune:
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+            self.router = nn.Sequential(
+                nn.Linear(in_channels, 3, bias=False)
+            )
 
     def forward(self, input):
-        distilled_c1 = self.act(self.c1_d(input))
-        r_c1 = (self.c1_r(input))
+        x = input
+        a,b,c,d = input.shape
+        self.sparsity = 1.0
+        if self.spa_prune:
+            p = self.avg_pool(input).view(a, b)
+            p = self.router(p)
+            p = F.softmax(p/3, dim=1)
+            idx = torch.mode(torch.argmax(p, dim=1)).values
+
+            prune_scale = [1, 2, 4]
+            input = nn.AvgPool2d(prune_scale[idx], stride=prune_scale[idx])(input)
+            self.sparsity = prune_scale[idx] * prune_scale[idx]
+
+        with torch.autograd.profiler.record_function("c1_d"):
+            distilled_c1 = self.act(self.c1_d(input))
+        with torch.autograd.profiler.record_function("c1_r"):
+            r_c1 = (self.c1_r(input))
         r_c1 = self.act(r_c1+input)
 
-        distilled_c2 = self.act(self.c2_d(r_c1))
-        r_c2 = (self.c2_r(r_c1))
+        with torch.autograd.profiler.record_function("c2_d"):
+            distilled_c2 = self.act(self.c2_d(r_c1))
+        with torch.autograd.profiler.record_function("c2_r"):
+            r_c2 = (self.c2_r(r_c1))
         r_c2 = self.act(r_c2+r_c1)
 
-        distilled_c3 = self.act(self.c3_d(r_c2))
-        r_c3 = (self.c3_r(r_c2))
+        with torch.autograd.profiler.record_function("c3_d"):
+            distilled_c3 = self.act(self.c3_d(r_c2))
+        with torch.autograd.profiler.record_function("c3_r"):
+            r_c3 = (self.c3_r(r_c2))
         r_c3 = self.act(r_c3+r_c2)
 
-        r_c4 = self.act(self.c4(r_c3))
+        with torch.autograd.profiler.record_function("c4"):
+            r_c4 = self.act(self.c4(r_c3))
 
+        if self.use_a2n:
+            with torch.autograd.profiler.record_function("rfdb_a2n"):
+                y = self.avg_pool(input).view(a,b)
+                y = self.ADM(y)
+                ax = F.softmax(y/4, dim = 1)
+                distilled_c1 = distilled_c1 * ax[:,0].view(a,1,1,1)
+                distilled_c2 = distilled_c2 * ax[:,1].view(a,1,1,1)
+                distilled_c3 = distilled_c3 * ax[:,2].view(a,1,1,1)
+                r_c4 = r_c4 * ax[:,3].view(a,1,1,1)
         out = torch.cat([distilled_c1, distilled_c2, distilled_c3, r_c4], dim=1)
-        out_fused = self.esa(self.c5(out))
+        if self.gct:
+            with torch.autograd.profiler.record_function("rfdb_gct"):
+                out_fused = self.c5(self.gct(out))
+        else:
+            with torch.autograd.profiler.record_function("esa"):
+                out_fused = self.esa(self.c5(out))
 
+        if self.spa_prune:
+            out_fused = F.interpolate(out_fused, scale_factor=prune_scale[idx], mode='nearest')
+            out_fused *= p[:, idx].unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            if not self.training:
+                outfused = out_fused.resize_(a, b, c, d) + x
+            else:
+                out_fused = out_fused + x
         return out_fused
-
 def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=3, stride=1):
     conv = conv_layer(in_channels, out_channels * (upscale_factor ** 2), kernel_size, stride)
     pixel_shuffle = nn.PixelShuffle(upscale_factor)

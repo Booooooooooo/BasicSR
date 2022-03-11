@@ -13,54 +13,84 @@ def make_model(args, parent=False):
 
 @ARCH_REGISTRY.register()
 class RFDN(nn.Module):
-    def __init__(self, num_in_ch=3, num_feat=50, num_modules=4, num_out_ch=3, upscale=4, from_t=False, act_type='lrelu', ds_rate=0.5, use_cbam=False, use_a2n=False, img_range=255.,rgb_mean=(0.4488, 0.4371, 0.4040)):
+    def __init__(self, in_nc=3, nf=50, num_modules=4, out_nc=3, upscale=4, from_t=False, act_type='lrelu',
+                ds_rate=0.25, use_cbam=False, use_a2n=False, rfdb_a2n=False, spa_prune=False, gct=False,
+                simam=False):
         super(RFDN, self).__init__()
         self.from_t = from_t
-        self.fea_conv = B.conv_layer(num_in_ch, num_feat, kernel_size=3)
+        self.num_modules = num_modules
+        self.fea_conv = B.conv_layer(in_nc, nf, kernel_size=3)
+        self.gct = gct
+        if gct:
+            self.gct_in = B.GCT(num_channels=nf)
 
-        self.B1 = B.RFDB(in_channels=num_feat, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam)
-        self.B2 = B.RFDB(in_channels=num_feat, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam)
-        self.B3 = B.RFDB(in_channels=num_feat, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam)
-        self.B4 = B.RFDB(in_channels=num_feat, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam)
-        self.c = B.conv_block(num_feat * num_modules, num_feat, kernel_size=1, act_type=act_type)
+        self.B1 = B.RFDB(in_channels=nf, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam, use_a2n=rfdb_a2n, spa_prune=spa_prune,
+                        gct=gct, simAM=simam)
+        self.B2 = B.RFDB(in_channels=nf, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam, use_a2n=rfdb_a2n, spa_prune=spa_prune,
+                        gct=gct, simAM=simam)
+        self.B3 = B.RFDB(in_channels=nf, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam, use_a2n=rfdb_a2n, spa_prune=spa_prune,
+                        gct=gct, simAM=simam)
+        if num_modules == 4:
+            self.B4 = B.RFDB(in_channels=nf, act_type=act_type, distillation_rate=ds_rate, use_cbam=use_cbam, use_a2n=rfdb_a2n, spa_prune=spa_prune,
+                        gct=gct, simAM=simam)
+        self.c = B.conv_block(nf * num_modules, nf, kernel_size=1, act_type=act_type)
 
         self.use_a2n = use_a2n
         if self.use_a2n:
             self.avg_pool = nn.AdaptiveAvgPool2d(1)
             self.ADM = nn.Sequential(
-                nn.Linear(num_feat, num_feat // 10, bias=False),
+                nn.Linear(nf, nf // 10, bias=False),
                 nn.ReLU(inplace=True),
-                nn.Linear(num_feat // 10, 4, bias=False),
+                nn.Linear(nf // 10, num_modules, bias=False),
             )
-        self.LR_conv = B.conv_layer(num_feat, num_feat, kernel_size=3)
+        self.LR_conv = B.conv_layer(nf, nf, kernel_size=3)
 
         upsample_block = B.pixelshuffle_block
-        self.upsampler = upsample_block(num_feat, num_out_ch, upscale_factor=upscale)
+        self.upsampler = upsample_block(nf, out_nc, upscale_factor=upscale)
         self.scale_idx = 0
 
 
     def forward(self, input):
-        out_fea = self.fea_conv(input)
+        with torch.autograd.profiler.record_function("fea_conv"):
+            out_fea = self.fea_conv(input)
+        if self.gct:
+            with torch.autograd.profiler.record_function("gct_in"):
+                out_fea = self.gct_in(out_fea)
         a, b, c, d = out_fea.shape
-        out_B1 = self.B1(out_fea)
-        out_B2 = self.B2(out_B1)
-        out_B3 = self.B3(out_B2)
-        out_B4 = self.B4(out_B3)
+        with torch.autograd.profiler.record_function("B1"):
+            out_B1 = self.B1(out_fea)
+        with torch.autograd.profiler.record_function("B2"):
+            out_B2 = self.B2(out_B1)
+        with torch.autograd.profiler.record_function("B3"):
+            out_B3 = self.B3(out_B2)
+        sparsity = self.B1.sparsity + self.B2.sparsity + self.B3.sparsity
+        if self.num_modules == 4:
+            with torch.autograd.profiler.record_function("B4"):
+                out_B4 = self.B4(out_B3)
+                sparsity += self.B4.sparsity
+        sparsity = sparsity / self.num_modules
 
         if self.use_a2n:
-            y = self.avg_pool(out_fea).view(a,b)
-            y = self.ADM(y)
-            ax = F.softmax(y/4, dim = 1)
-            out_B1 = out_B1 * ax[:,0].view(a,1,1,1)
-            out_B2 = out_B2 * ax[:,1].view(a,1,1,1)
-            out_B3 = out_B3 * ax[:,1].view(a,1,1,1)
-            out_B4 = out_B4 * ax[:,1].view(a,1,1,1)
+            with torch.autograd.profiler.record_function("A2N"):
+                y = self.avg_pool(out_fea).view(a,b)
+                y = self.ADM(y)
+                ax = F.softmax(y/self.modules, dim = 1)
+                out_B1 = out_B1 * ax[:,0].view(a,1,1,1)
+                out_B2 = out_B2 * ax[:,1].view(a,1,1,1)
+                out_B3 = out_B3 * ax[:,2].view(a,1,1,1)
+                if self.num_modules == 4:
+                    out_B4 = out_B4 * ax[:,3].view(a,1,1,1)
 
-        out_B = self.c(torch.cat([out_B1, out_B2, out_B3, out_B4], dim=1))
-        out_lr = self.LR_conv(out_B) + out_fea
+        if self.num_modules == 4:
+            out_B = self.c(torch.cat([out_B1, out_B2, out_B3, out_B4], dim=1))
+        elif self.num_modules == 3:
+            out_B = self.c(torch.cat([out_B1, out_B2, out_B3], dim=1))
+        with torch.autograd.profiler.record_function("LR_conv"):
+            out_lr = self.LR_conv(out_B) + out_fea
 
         output = self.upsampler(out_lr)
 
+        # return output, sparsity
         return output
 
     def set_scale(self, scale_idx):
